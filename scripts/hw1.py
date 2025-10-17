@@ -141,11 +141,14 @@ class GaussianDiffusion:
         # =========================
         # To Do
         # =========================
-        self.alphas = 0
-        self.alpha_bars = 0
-        self.sqrt_alpha_bars = 0
-        self.sqrt_one_minus_alpha_bars = 0
-        self.alpha_bars_prev = 0
+        self.alphas = 1.0 - self.betas
+        self.alpha_bars = torch.cumprod(self.alphas, dim=0)
+        self.sqrt_alpha_bars = torch.sqrt(self.alpha_bars)
+        self.sqrt_one_minus_alpha_bars = torch.sqrt(1.0 - self.alpha_bars)
+        # alpha_bars_prev corresponds to alpha_bar_{t-1}, with alpha_bar_0 = 1
+        self.alpha_bars_prev = torch.cat(
+            [torch.tensor([1.0], device=self.device), self.alpha_bars[:-1]]
+        )
 
         self.T = betas.numel()
         self.mse = nn.MSELoss()
@@ -161,7 +164,13 @@ class GaussianDiffusion:
         """
 
         # please follow eq 4. in DDPM paper
-        pass
+        # Implements q(x_t|x_0) = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * noise
+        sqrt_alpha_bars_t = self.sqrt_alpha_bars[t].view(-1, *([1] * (x0.dim() - 1)))
+        sqrt_one_minus_alpha_bars_t = self.sqrt_one_minus_alpha_bars[t].view(
+            -1, *([1] * (x0.dim() - 1))
+        )
+        xt = sqrt_alpha_bars_t * x0 + sqrt_one_minus_alpha_bars_t * noise
+        return xt
 
     def p_losses(self, x0: torch.Tensor, noise: torch.Tensor):
         """
@@ -170,7 +179,12 @@ class GaussianDiffusion:
         """
 
         # please follow algo 1. in DDPM paper
-        pass
+        # Implements L = E_{t, epsilon} || epsilon - epsilon_theta(x_t, t) ||^2
+        t = self.sample_timesteps(x0.shape[0])
+        xt = self.q_sample(x0, t, noise)
+        predicted_noise = self.model(xt, t)
+        loss = self.mse(noise, predicted_noise)
+        return loss
 
     def train_one_epoch(self, loader, optimizer):
         self.model.train()
@@ -202,7 +216,26 @@ class GaussianDiffusion:
             # To Do
             # =========================
             # please follow algo 2. in DDPM paper and update x
-            pass
+            t = torch.full((n,), i, device=self.device, dtype=torch.long)
+            predicted_noise = self.model(x, t)
+
+            # Coefficients for the update rule
+            alpha_t = self.alphas[i]
+            alpha_bar_t = self.alpha_bars[i]
+            alpha_bar_prev_t = self.alpha_bars_prev[i]
+
+            # Variance term sigma_t^2
+            beta_t = self.betas[i]
+            sigma_t_sq = (1.0 - alpha_bar_prev_t) / (1.0 - alpha_bar_t) * beta_t
+            sigma_t = torch.sqrt(sigma_t_sq)
+
+            # Noise term z
+            z = torch.randn_like(x) if i > 0 else torch.zeros_like(x)
+
+            # Update rule for x_{t-1}
+            coeff1 = 1.0 / torch.sqrt(alpha_t)
+            coeff2 = (1.0 - alpha_t) / torch.sqrt(1.0 - alpha_bar_t)
+            x = coeff1 * (x - coeff2 * predicted_noise) + sigma_t * z
 
             traj.append(x.detach().cpu().numpy())
         x0 = x.detach().cpu().numpy()
@@ -224,8 +257,49 @@ class GaussianDiffusion:
             # =========================
             # To Do
             # =========================
-            # please follow eq 12 and 16 in DDPM paper and update x
-            pass
+            # please follow eq 12 and 16 in DDIM paper and update x
+            # Current and previous timesteps
+            t_val = idx[i]
+            t_prev_val = idx[i - 1] if i > 0 else -1
+
+            t = torch.full((n,), t_val, device=self.device, dtype=torch.long)
+
+            # Predict noise
+            predicted_noise = self.model(x, t)
+
+            # Get alpha_bar values
+            alpha_bar = self.alpha_bars[t_val]
+            alpha_bar_prev = self.alpha_bars[t_prev_val] if i > 0 else 1.0
+
+            # Reshape for broadcasting
+            alpha_bar = alpha_bar.view(-1, 1)
+            alpha_bar_prev = torch.tensor(alpha_bar_prev, device=self.device).view(
+                -1, 1
+            )
+
+            # Predict x_0
+            pred_x0 = (x - torch.sqrt(1.0 - alpha_bar) * predicted_noise) / torch.sqrt(
+                alpha_bar
+            )
+
+            # Calculate sigma_t
+            sigma_t_sq = (
+                eta
+                * ((1.0 - alpha_bar_prev) / (1.0 - alpha_bar))
+                * (1.0 - alpha_bar / alpha_bar_prev)
+            )
+            sigma_t = torch.sqrt(sigma_t_sq)
+
+            # Direction pointing to x_t
+            pred_dir_to_xt = (
+                torch.sqrt(1.0 - alpha_bar_prev - sigma_t_sq) * predicted_noise
+            )
+
+            # Noise term (only if eta > 0 and not the last step)
+            z = torch.randn_like(x) if eta > 0 and i > 0 else torch.zeros_like(x)
+
+            # Update rule for x_{t-1}
+            x = torch.sqrt(alpha_bar_prev) * pred_x0 + pred_dir_to_xt + sigma_t * z
 
             traj.append(x.detach().cpu().numpy())
         x0 = x.detach().cpu().numpy()
