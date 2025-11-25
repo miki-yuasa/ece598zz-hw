@@ -148,8 +148,8 @@ class MDM:
         rand = torch.rand(B, L, device=x0.device)
 
         # Mask with probability t for each example
-        # t is (B,), expand to (B, L) for comparison
-        t_expanded = t[:, None].expand(B, L)
+        # t is (B,), reshape to (B, 1) to broadcast
+        t_expanded = t.view(-1, 1).expand(B, L)
 
         # mask is True where we mask (with probability t)
         mask = rand < t_expanded
@@ -179,24 +179,24 @@ class MDM:
         # Get model predictions: logits over vocabulary for each position
         logits = self.model(xt, t)  # (B, L, V)
 
-        # Compute log probabilities
-        log_probs = F.log_softmax(logits, dim=-1)  # (B, L, V)
-
-        # Get log probability of the true token x0 at each position
-        # log_probs is (B, L, V), x0 is (B, L)
-        log_probs_true = log_probs.gather(dim=-1, index=x0.unsqueeze(-1)).squeeze(
-            -1
+        # Compute Cross Entropy Loss
+        # F.cross_entropy handles log_softmax + nll_loss numerically stably
+        # We use the full logits (including mask token) to match standard implementations
+        # Input: (B, V, L) for cross_entropy, Target: (B, L)
+        loss_ce = F.cross_entropy(
+            logits.transpose(1, 2), x0, reduction="none"
         )  # (B, L)
 
         # Mask out unmasked positions (only compute loss for masked positions)
-        # mask is (B, L) boolean
-        log_probs_masked = log_probs_true * mask.float()  # (B, L)
+        # loss_ce is -log_prob(x0), which is positive.
+        # We want to minimize NLL, so we keep these positive values.
+        loss_masked = loss_ce * mask.float()  # (B, L)
 
         # Sum over positions for each example
-        sum_log_probs = log_probs_masked.sum(dim=1)  # (B,)
+        sum_loss = loss_masked.sum(dim=1)  # (B,)
 
-        # Weight by 1/t per example and negate
-        weighted_loss = -sum_log_probs / t  # (B,)
+        # Weight by 1/t per example
+        weighted_loss = sum_loss / t  # (B,)
 
         # Average over batch
         loss = weighted_loss.mean()
